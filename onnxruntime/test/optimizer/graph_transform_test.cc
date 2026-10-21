@@ -5585,6 +5585,40 @@ TEST_F(GraphTransformationTests, TransposeMatmulNoFusionForCpuFp16) {
       TransformerLevel::Level2, 1, check_unfused, check_unfused));
 }
 
+TEST_F(GraphTransformationTests, TransposeMatmulFusionWithZeroSizedBatchTranspose) {
+  // Transpose(perm=[1, 2, 0]) and Transpose(perm=[0, 2, 1]) fuse into FusedMatMul with transBatchA set, and the
+  // zero-sized leading dim of A must not make the fused kernel divide by zero. K is 0, so the output is all zeros.
+  auto build_test_case = [](ModelTestBuilder& builder) {
+    auto* a = builder.MakeInput<float>({0, 3, 2}, std::vector<float>{});
+    auto* b = builder.MakeInput<float>({3, 2, 0}, std::vector<float>{});
+    auto* a_transposed = builder.MakeIntermediate<float>({{3, 2, 0}});
+    auto* b_transposed = builder.MakeIntermediate<float>({{3, 0, 2}});
+    auto* output = builder.MakeOutput<float>({{3, 2, 2}});
+
+    builder.AddNode("Transpose", {a}, {a_transposed})
+        .AddAttribute("perm", std::vector<int64_t>{1, 2, 0});
+    builder.AddNode("Transpose", {b}, {b_transposed})
+        .AddAttribute("perm", std::vector<int64_t>{0, 2, 1});
+    builder.AddNode("MatMul", {a_transposed, b_transposed}, {output});
+  };
+
+  auto check_fused = [](InferenceSessionWrapper& session) {
+    auto op_to_count = CountOpsInGraph(session.GetGraph());
+    ASSERT_EQ(op_to_count["Transpose"], 0);
+    ASSERT_EQ(op_to_count["MatMul"], 0);
+    ASSERT_EQ(op_to_count["com.microsoft.FusedMatMul"], 1);
+  };
+
+  TransformerTester(build_test_case,
+                    check_fused,
+                    TransformerLevel::Default,
+                    TransformerLevel::Level1,
+                    13,
+                    0.0,
+                    0.0,
+                    std::make_unique<MatmulTransposeFusion>());
+}
+
 TEST_F(GraphTransformationTests, TransposeCastMatmulFusion) {
   const std::vector<PathString> model_uris = {
       MODEL_FOLDER "fusion/transpose_cast_matmul_4d_fusion0.onnx",  // Test fusion from the right input

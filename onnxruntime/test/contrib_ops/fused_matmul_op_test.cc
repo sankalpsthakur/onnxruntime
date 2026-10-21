@@ -514,6 +514,50 @@ TEST(FusedMatMulOpTest, DoubleTypeEmptyKDim) {
   test.Run();
 }
 
+// A batch-transposed operand with a zero leading dim has empty matrices, which must not divide the batch offsets by 0.
+static void RunTransposeBatchZeroLeadingDimTest(const std::vector<int64_t>& a_dims, const std::vector<int64_t>& b_dims,
+                                                bool transa, bool transb, bool trans_batch_a, bool trans_batch_b,
+                                                const std::vector<int64_t>& y_dims) {
+  OpTester test("FusedMatMul", 1, onnxruntime::kMSDomain);
+  test.AddInput<double>("A", a_dims, std::vector<double>(static_cast<size_t>(TensorShape(a_dims).Size()), 1.0));
+  test.AddInput<double>("B", b_dims, std::vector<double>(static_cast<size_t>(TensorShape(b_dims).Size()), 1.0));
+  test.AddAttribute("transA", static_cast<int64_t>(transa));
+  test.AddAttribute("transB", static_cast<int64_t>(transb));
+  test.AddAttribute("transBatchA", static_cast<int64_t>(trans_batch_a));
+  test.AddAttribute("transBatchB", static_cast<int64_t>(trans_batch_b));
+  test.AddAttribute("alpha", 1.0f);
+  // Either the output is empty or K=0 and the output is all zeros.
+  test.AddOutput<double>("Y", y_dims, std::vector<double>(static_cast<size_t>(TensorShape(y_dims).Size()), 0.0));
+  // Same exclusions as RunFusedMatMulTest for the transBatch cases.
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "",
+           {kTensorrtExecutionProvider, kQnnExecutionProvider, kOpenVINOExecutionProvider});
+}
+
+TEST(FusedMatMulOpTest, DoubleTypeTransposeBatchAEmptyM) {
+  // A is stored as [M=0, batch, K].
+  RunTransposeBatchZeroLeadingDimTest({0, 3, 2}, {3, 2, 4}, false, false, true, false, {3, 0, 4});
+}
+
+TEST(FusedMatMulOpTest, DoubleTypeTransposeBatchAEmptyK) {
+  // A is stored as [K=0, batch, M] and B as [batch, N, K=0], as produced by fusing Transpose into MatMul.
+  RunTransposeBatchZeroLeadingDimTest({0, 3, 2}, {3, 2, 0}, true, true, true, false, {3, 2, 2});
+}
+
+TEST(FusedMatMulOpTest, DoubleTypeTransposeBatchBEmptyN) {
+  // B is stored as [N=0, batch, K].
+  RunTransposeBatchZeroLeadingDimTest({3, 4, 2}, {0, 3, 2}, false, true, false, true, {3, 4, 0});
+}
+
+TEST(FusedMatMulOpTest, DoubleTypeTransposeBatchBEmptyK) {
+  // B is stored as [K=0, batch, N].
+  RunTransposeBatchZeroLeadingDimTest({3, 2, 0}, {0, 3, 4}, false, false, false, true, {3, 2, 4});
+}
+
+TEST(FusedMatMulOpTest, DoubleTypeTransposeBatchABEmptyK) {
+  // A is stored as [K=0, batch, M] and B as [K=0, batch, N].
+  RunTransposeBatchZeroLeadingDimTest({0, 3, 2}, {0, 3, 4}, true, false, true, true, {3, 2, 4});
+}
+
 }  // namespace transpose_matmul
 }  // namespace test
 }  // namespace onnxruntime

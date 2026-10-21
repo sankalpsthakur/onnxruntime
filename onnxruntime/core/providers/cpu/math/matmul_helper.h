@@ -259,8 +259,9 @@ class MatMulComputeHelper {
       return;
     }
 
-    left_mat_size_ = M_ * K_ / left_stride_factor_;
-    right_mat_size_ = K_ * N_ / right_stride_factor_;
+    // A zero stride factor is a zero leading dim moved by trans_batch_a/b, so those matrices are empty.
+    left_mat_size_ = left_stride_factor_ == 0 ? 0 : M_ * K_ / left_stride_factor_;
+    right_mat_size_ = right_stride_factor_ == 0 ? 0 : K_ * N_ / right_stride_factor_;
     output_mat_size_ = M_ * N_;
 
     if (fill_offsets) {
