@@ -1,0 +1,170 @@
+# Fork-only validation for the NCHWc zero-batch fix. Never part of an upstream PR.
+name: fork-validate-large-ort-nchwc
+
+on:
+  push:
+    branches: ['validate/**']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # microsoft/onnxruntime main the fix commit was made on (HEAD~2 on this branch).
+  BASE_SHA: c55286e574e728117542787ab674db1f52aab290
+
+jobs:
+  wheel-repro:
+    name: released wheel repro (Linux x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install released packages
+        run: python -m pip install onnx onnxruntime numpy
+      - name: Write the repro from the issue
+        run: |
+          cat > repro.py <<'PY'
+          import copy
+          import hashlib
+          import json
+          import tempfile
+          from pathlib import Path
+          import numpy as np
+          import onnx
+          import onnxruntime as ort
+          from onnx import helper as h, numpy_helper as nh
+
+          def run(model, feeds, optimize=False, disabled=(), export=None):
+              options = ort.SessionOptions()
+              options.graph_optimization_level = (ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                  if optimize else ort.GraphOptimizationLevel.ORT_DISABLE_ALL)
+              options.intra_op_num_threads = options.inter_op_num_threads = 1
+              options.log_severity_level = 4
+              if export is not None:
+                  options.optimized_model_filepath = str(export)
+              session = ort.InferenceSession(model.SerializeToString(), options,
+                  providers=["CPUExecutionProvider"], disabled_optimizers=set(disabled))
+              assert [v.name for v in session.get_outputs()] == [v.name for v in model.graph.output]
+              return session.run(None, feeds)
+
+          def exact(left, right):
+              return len(left) == len(right) and all(isinstance(a, np.ndarray) and isinstance(b, np.ndarray)
+                  and a.shape == b.shape and a.dtype == b.dtype and np.array_equal(a, b)
+                  for a, b in zip(left, right))
+
+          def describe(values):
+              return [None if a is None else {"shape": list(a.shape), "dtype": str(a.dtype),
+                  "sample": a.reshape(-1)[:8].tolist()} for a in values]
+
+          def make_source():
+              nodes = [
+                  h.make_node('FusedConv', ['input', 'constant_token_5', 'constant_token_6'], ['node_token_2'], activation='Relu', group=1, auto_pad='NOTSET', domain='com.microsoft'),
+                  h.make_node('Identity', ['input'], ['__ra_edge_badb50ac74']),
+                  h.make_node('FusedConv', ['__ra_edge_badb50ac74', 'constant', 'constant_token_3'], ['node_token_1'], activation='Relu', group=1, auto_pad='NOTSET', domain='com.microsoft'),
+                  h.make_node('Add', ['node_token_1', 'node_token_2'], ['output']),
+              ]
+              initializers = [
+                  nh.from_array(np.resize(np.array([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, -23.0, -22.0, -21.0, -20.0, -19.0, -18.0, -17.0, -16.0, -15.0, -14.0, -13.0, -12.0, -11.0, -10.0, -9.0, -8.0, -7.0, -6.0, -5.0, -4.0, -3.0, -2.0, -1.0], dtype='float32'), (32, 32, 3, 3)), 'constant'),
+                  nh.from_array(np.array([16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, -23.0, -22.0, -21.0, -20.0, -19.0, -18.0, -17.0, -16.0, -15.0, -14.0, -13.0, -12.0, -11.0, -10.0, -9.0, -8.0, -7.0, -6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0], dtype='float32'), 'constant_token_3'),
+                  nh.from_array(np.resize(np.array([2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, -23.0, -22.0, -21.0, -20.0, -19.0, -18.0, -17.0, -16.0, -15.0, -14.0, -13.0, -12.0, -11.0, -10.0, -9.0, -8.0, -7.0, -6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0], dtype='float32'), (32, 32, 3, 3)), 'constant_token_5'),
+                  nh.from_array(np.array([18.0, 19.0, 20.0, 21.0, 22.0, -23.0, -22.0, -21.0, -20.0, -19.0, -18.0, -17.0, -16.0, -15.0, -14.0, -13.0, -12.0, -11.0, -10.0, -9.0, -8.0, -7.0, -6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0], dtype='float32'), 'constant_token_6'),
+              ]
+              return h.make_model(h.make_graph(nodes, "repro", [h.make_tensor_value_info('input', 1, [0, 32, 23, 23])],
+                  [h.make_tensor_value_info('output', 1, [0, 32, 21, 21])], initializers),
+                  opset_imports=[h.make_opsetid('', 13), h.make_opsetid('com.microsoft', 1)], ir_version=10)
+
+          source = make_source()
+          onnx.checker.check_model(source, full_check=True)
+          onnx.shape_inference.infer_shapes(source, strict_mode=True)
+          feeds = {'input': np.empty((0, 32, 23, 23), dtype='float32')}
+          expected = [np.empty((0, 32, 21, 21), dtype=np.float32)]
+          before = run(source, feeds)
+          assert exact(before, expected), (describe(before), describe(expected))
+          guarded = run(source, feeds, optimize=True, disabled=('NchwcTransformer',))
+          assert exact(before, guarded)
+          try:
+              run(source, feeds, optimize=True)
+          except Exception as error:
+              assert all(token in str(error) for token in ['Reshape', '0']), str(error)
+              print(type(error).__name__, str(error).split("Status Message:")[0])
+          else:
+              raise AssertionError("The reported optimization failure did not reproduce")
+          print("source_sha256", hashlib.sha256(source.SerializeToString()).hexdigest())
+          print("ort", ort.__version__, ort.get_build_info())
+          print("REPRODUCED")
+          PY
+      - name: Run it
+        run: |
+          python -c "import onnxruntime as o, onnx as x; print('onnxruntime', o.__version__, 'onnx', x.__version__)"
+          grep -o -m1 -w avx2 /proc/cpuinfo || echo "no avx2"
+          set +e
+          python repro.py > out.txt 2>&1
+          rc=$?
+          tail -n 6 out.txt | cut -c1-220 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "repro exit=$rc (0 means the failure from the issue reproduced)" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+  build-test:
+    name: ${{ matrix.variant }} / onnxruntime_test_all
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fixed, baseline]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 3
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Revert only nchwc_transformer.cc to the base commit (baseline)
+        if: matrix.variant == 'baseline'
+        run: |
+          git log --oneline -3
+          test "$(git rev-parse HEAD~2)" = "$BASE_SHA"
+          git checkout HEAD~2 -- onnxruntime/core/optimizer/nchwc_transformer.cc
+          git diff --cached --stat
+      - name: Build onnxruntime_test_all (CPU, Release)
+        run: >
+          python tools/ci_build/build.py --config Release --build_dir build --parallel --skip_tests
+          --skip_submodule_sync --compile_no_warning_as_error
+          --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=ON
+          --target onnxruntime_test_all
+      - name: New tests (fixed must pass, baseline must fail)
+        working-directory: build/Release
+        run: |
+          grep -o -m1 -w avx2 /proc/cpuinfo || echo "no avx2"
+          grep -o -m1 -w avx512f /proc/cpuinfo || echo "no avx512f"
+          NEW_TESTS="NchwcOptimizerTests.ConvBinaryZeroBatch NchwcOptimizerTests.ConvBinarySymbolicBatchZeroAtRuntime"
+          set +e
+          bad=0
+          for t in $NEW_TESTS; do
+            # a gtest filter that matches nothing exits 0, so require the test to be listed first
+            ./onnxruntime_test_all --gtest_list_tests --gtest_filter="$t" | grep -q "${t#*.}" || { echo "MISSING $t"; bad=1; continue; }
+            ./onnxruntime_test_all --gtest_filter="$t" > "log_$t.txt" 2>&1
+            rc=$?
+            grep -m4 -E "Invalid Target|cannot be reshaped|Failure|OK \]|FAILED  \]" "log_$t.txt" | cut -c1-240
+            echo "$t exit=$rc" | tee -a "$GITHUB_STEP_SUMMARY"
+            if [ "${{ matrix.variant }}" = fixed ] && [ $rc -ne 0 ]; then bad=1; fi
+            if [ "${{ matrix.variant }}" = baseline ] && [ $rc -eq 0 ]; then echo "UNEXPECTED PASS on baseline: $t"; bad=1; fi
+          done
+          exit $bad
+      - name: Related existing tests (regression check)
+        if: matrix.variant == 'fixed' && always()
+        working-directory: build/Release
+        run: |
+          ./onnxruntime_test_all --gtest_filter='NchwcOptimizerTests.*:*Nchwc*' 2>&1 | tail -n 25
+          exit ${PIPESTATUS[0]}
